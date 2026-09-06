@@ -1,0 +1,19 @@
+# Phase 2-3 (current)
+numpy>=1.26
+requests>=2.31
+websockets>=12
+
+# Phase 4 — Gemini Robotics ER 2 streaming (installed)
+google-genai>=2.21
+sounddevice>=0.4
+
+# Phase 5-6 — local semantic memory (light stack, no PyTorch)
+# sqlite-vec>=0.1.6
+# model2vec>=0.3
+
+# Phase 9 — local CV / tracking
+# mediapipe>=0.10
+# opencv-python>=4.9
+
+# dev
+pytest>=8

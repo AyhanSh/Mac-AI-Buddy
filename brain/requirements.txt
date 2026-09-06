@@ -1,7 +1,0 @@
-openai
-elevenlabs
-sounddevice
-httpx
-fastembed
-numpy
-opencv-python-headless
