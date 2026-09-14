@@ -1,4 +1,4 @@
-# minibot
+# Mac AI Buddy
 
 A small desk robot you talk to. It listens through a microphone, thinks with
 Gemini, answers out loud in a cloned voice, turns its head, looks at things
