@@ -1,5 +1,5 @@
 # Mac AI Buddy
-[logo]: https://github.com/AyhanSh/Mac-AI-Buddy/blob/main/mac.png
+![alt text](https://github.com/AyhanSh/Mac-AI-Buddy/blob/main/mac.png)
 A small desk robot you talk to. It listens through a microphone, thinks with
 Gemini, answers out loud in a cloned voice, turns its head, looks at things
 with its camera, remembers what you tell it, and — if you let it — posts to its
