@@ -114,8 +114,10 @@
                               // and overrides this per turn
 #define MIC_LEAD_MS     3000  // give up if nobody starts talking within this
 
-const char* WIFI_SSID = "hauz";
-const char* WIFI_PASS = "mehdi_bu_bu_bu_1";
+// WiFi credentials live in wifi_secrets.h, which is gitignored so they are
+// never published. Copy wifi_secrets.example.h to wifi_secrets.h, next to
+// this file, and fill in your network.
+#include "wifi_secrets.h"
 #define WIFI_TIMEOUT_MS 20000
 
 // ============================================================
@@ -1134,6 +1136,13 @@ void setup() {
 
   // --- WiFi ---
   WiFi.mode(WIFI_STA);
+  // Modem sleep off. It is on by default and lets the radio doze between
+  // router beacons, which is right for a battery sensor and wrong for a
+  // server: measured 0.07-1.6 s per /status and dropped pings with it on,
+  // where a LAN round trip should be ~20 ms. Costs a steady ~80 mA more, but
+  // a steady draw, not the wake-up bursts the missing caps dislike.
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);   // rejoin by itself after a drop
   WiFi.setTxPower(WIFI_POWER_11dBm);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("WiFi");

@@ -202,12 +202,12 @@ class XAccount:
         return self.post(text, jpeg, to_post_id)
 
     # -- reading ---------------------------------------------------
-    def mentions(self, limit: int = 5) -> list[dict]:
+    def mentions(self, limit: int = 5, since_id: str = "") -> list[dict]:
         user_id = self.identity.get("id")
         if not user_id:
             self.verify()
             user_id = self.identity.get("id", "")
-        return self.client.mentions(user_id, limit)
+        return self.client.mentions(user_id, limit, since_id)
 
     # -- guards ----------------------------------------------------
     def _validate(self, text: str) -> str:

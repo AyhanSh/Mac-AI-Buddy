@@ -16,12 +16,14 @@ Phase 3 reproduces the mac_realtime.py loop exactly:
 from __future__ import annotations
 
 import asyncio
+import re
+import threading
 from typing import Any
 
 from ..ai.provider import IMAGE_RESULT_KEY, AIProvider, ToolSpec
 from ..audio.capture import (capture_turn, duration_ms, source_gain, speech_ms,
                              trim_tail)
-from ..audio.dsp import wav_to_pcm
+from ..audio.dsp import BOT_RATE, wav_to_pcm
 from ..audio.vad import Room, calibrate, wait_for_voice
 from ..config import Settings
 from ..events.bus import Event, EventBus
@@ -42,9 +44,10 @@ MIN_SPEECH_MS = 120
 # really means here is that the robot stops ACTING — no speech, no movement, no
 # tools, nothing reaching X — while one ear stays open for the wake phrase.
 #
-# That ear is Gemini's, because there is no local speech recognition in this
-# stack. Uploading the room while the person believes they muted it would be
-# the wrong reading of the word, so only clips short enough to BE the wake
+# With a cloud provider that ear is the provider's own speech recognition.
+# (With AI_PROVIDER=ollama it is local Whisper and nothing leaves the machine
+# either way.) Uploading the room while the person believes they muted it would
+# be the wrong reading of the word, so only clips short enough to BE the wake
 # phrase are sent at all. Anything longer is dropped on the Mac and never
 # leaves it — you can hold a whole conversation in front of a muted robot and
 # none of it goes anywhere.
@@ -60,6 +63,30 @@ MUTED_WAKE_PROMPT = (
     "listening again. If they did, call unmute. If they did not, do nothing "
     "and say nothing at all — they are not talking to you.")
 
+# The mute phrases, matched on the local transcript before the model sees the
+# turn. Muting is too important to leave to whether a small local model
+# remembers to call a tool: observed with qwen3-vl, "Mute mode." got the reply
+# "I'm muted now" and no mute call, so the robot said it was muted and wasn't.
+# Strict whole-utterance matches only, so "don't mute the TV" stays a sentence.
+_MUTE_ON = re.compile(
+    r"^(?:please |ok(?:ay)? )?(?:go |be )?(?:on )?mute(?:d)?"
+    r"(?: mode| on| now)?(?: please)?$")
+_MUTE_OFF = re.compile(
+    r"^(?:please |ok(?:ay)? )?(?:mute off|unmute|un-mute|turn off mute"
+    r"|mute mode off)(?: please)?$")
+
+
+def spoken_mute_command(transcript: str) -> str | None:
+    """'mute', 'unmute' or None for an utterance."""
+    words = re.sub(r"[^\w\s-]", "", transcript.lower()).strip()
+    words = " ".join(words.split())
+    if _MUTE_OFF.match(words):
+        return "unmute"
+    if _MUTE_ON.match(words):
+        return "mute"
+    return None
+
+
 # Fail closed: a tool added later is muted by default, and has to be named here
 # to work while muted.
 TOOLS_ALLOWED_WHILE_MUTED = frozenset({"unmute"})
@@ -69,7 +96,8 @@ class RobotAgent:
     def __init__(self, settings: Settings, hardware: RobotHardware,
                  provider: AIProvider, speech: SpeechProvider, bus: EventBus,
                  memory: MemoryManager | None = None,
-                 x: XAccount | None = None):
+                 x: XAccount | None = None,
+                 speaker=None):
         self.settings = settings
         self.hw = hardware
         self.ai = provider
@@ -77,11 +105,20 @@ class RobotAgent:
         self.bus = bus
         self.memory = memory   # None = degrade gracefully, no long-term memory (§21)
         self.x = x             # None = no X account configured, tools unregistered
+        # The Mac's speakers when the voice plays there (AUDIO_OUTPUT=mac);
+        # None = it plays on the robot.
+        self.speaker = speaker
         self.tools = ToolRegistry()
         self.room: Room | None = None
         self.mic = None    # set in start(); Esp32Client or MacMicSource
         self.vad = False
         self.muted = False
+        # Reply text waiting to be spoken, and the task that speaks it. See
+        # _on_reply_text: speech starts on the first sentence, not the last.
+        self._speech_q: asyncio.Queue[str] | None = None
+        self._speaker: asyncio.Task | None = None
+        # Set on shutdown to release the listening thread (see wait_for_voice).
+        self._stopping = threading.Event()
         self._register_tools()
 
     # -- tools -----------------------------------------------------
@@ -522,7 +559,10 @@ class RobotAgent:
         self.muted = True
         # Set directly, not through _face(): a muted robot holds this one
         # expression, and it is the only signal that the mode took effect.
-        await self._run(self.hw.set_expression, "sleep")
+        try:
+            await self._run(self.hw.set_expression, "sleep")
+        except Exception as e:
+            ROBOT.debug(f"sleep face failed: {e!r}")
         await self._chirp((660, 90), (440, 130))    # falling: going away
         APP.info("muted — say 'mute off' to come back")
         await self.bus.publish(Event.STATE_CHANGED, state="muted")
@@ -557,7 +597,12 @@ class RobotAgent:
         than blinking through listening/thinking at someone it is ignoring."""
         if self.muted:
             return
-        await self._run(self.hw.set_expression, emotion)
+        try:
+            await self._run(self.hw.set_expression, emotion)
+        except Exception as e:
+            # A face is decoration. A robot that dropped off WiFi, or is not
+            # attached at all, must still answer.
+            ROBOT.debug(f"face {emotion!r} failed: {e!r}")
 
     async def _dispatch(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
         """Every model-requested action passes through here.
@@ -584,14 +629,18 @@ class RobotAgent:
         # _dispatch, not tools.dispatch: the mute gate has to sit in front of
         # every tool call the model makes.
         self.ai.register_tools(self.tools.specs, self._dispatch)
+        self._speech_q = asyncio.Queue()
+        self._speaker = asyncio.create_task(self._speak_loop())
+        self.ai.on_text = self._on_reply_text
         await self.ai.connect()
 
         self.mic = await self._build_mic()
 
-        if self.settings.volume:
-            await self._run(self.hw_client.volume, self.settings.volume)
-        await self._run(self.hw_client.beep, 1047, 80)
-        await self._run(self.hw.set_expression, "neutral")
+        if self.hw_client:      # None when running without the robot body
+            if self.settings.volume:
+                await self._run(self.hw_client.volume, self.settings.volume)
+            await self._run(self.hw_client.beep, 1047, 80)
+        await self._face("neutral")
 
         s = self.settings
         self.room = await self._run(
@@ -600,6 +649,14 @@ class RobotAgent:
                               onset_margin=s.vad_onset_margin,
                               endpoint_mult=s.vad_endpoint_mult,
                               endpoint_margin=s.vad_endpoint_margin))
+        if self.room.floor < 1:
+            # A real microphone is never perfectly silent. Exactly zero is a
+            # mic that is switched off: on a MacBook, the built-in one goes
+            # dead when the lid is closed — observed 2026-10-05 with an
+            # external display attached and the EarPods unplugged.
+            APP.warn("the microphone is sending pure silence — it will never "
+                     "hear you. Closed MacBook lid? Mic permission not granted "
+                     "to this terminal? Plug in the EarPods or set MIC_DEVICE.")
 
     async def _build_mic(self):
         """The computer's own microphone, unless AUDIO_INPUT explicitly asks
@@ -626,7 +683,8 @@ class RobotAgent:
         if mode != "mac":
             APP.warn(f"unknown AUDIO_INPUT={mode!r}, using the computer's mic")
         from ..audio.mac_mic import MacMicSource
-        mic = await self._run(MacMicSource)
+        mic = await self._run(MacMicSource, BOT_RATE,
+                              self.settings.mic_device or None)
         self.vad = True   # local endpointing, always available
         APP.info("mic: this computer (local endpointing)")
         return mic
@@ -638,11 +696,45 @@ class RobotAgent:
         return getattr(self.hw, "client", None)
 
     async def stop(self) -> None:
+        self._stopping.set()
         try:
             await self._run(self.hw.set_expression, "sleep")
         except Exception:
             pass
+        if self._speaker is not None:
+            self._speaker.cancel()
         await self.ai.disconnect()
+
+    # -- speaking --------------------------------------------------
+    async def _on_reply_text(self, text: str) -> None:
+        """A sentence of the reply, handed over while the model is still
+        writing the rest. Muting is checked per sentence for the same reason
+        _turn() checks it after the turn: mute and unmute are tool calls made
+        during the turn, and whatever comes after them follows the new state."""
+        if self.muted:
+            AI.debug(f"muted, not speaking: {text!r}")
+            return
+        if self._speech_q is not None:
+            self._speech_q.put_nowait(text)
+
+    async def _speak_loop(self) -> None:
+        """Speaks queued reply text in order, one TTS request at a time.
+        Whatever piled up while the previous sentence was being spoken goes
+        out as one request — fewer seams in the voice, fewer round trips."""
+        assert self._speech_q is not None
+        while True:
+            text = await self._speech_q.get()
+            n = 1
+            while not self._speech_q.empty():
+                text += " " + self._speech_q.get_nowait()
+                n += 1
+            try:
+                await self._run(self.speech.synthesize, text)
+            except Exception as e:
+                AI.warn(f"speaking failed: {e!r}")
+            finally:
+                for _ in range(n):
+                    self._speech_q.task_done()
 
     # -- conversation ----------------------------------------------
     async def run_forever(self) -> None:
@@ -653,15 +745,22 @@ class RobotAgent:
     async def listen_and_respond(self) -> None:
         # Never start listening while the speaker is still going, or the bot
         # triggers its own turn on the tail of its own voice.
-        await self._run(self.hw_client.wait_quiet)
+        await self._run(self.speaker.wait_quiet if self.speaker
+                        else self.hw_client.wait_quiet)
         await asyncio.sleep(0.25)
-        await self._run(wait_for_voice, self.mic, self.room)
+        await self._run(lambda: wait_for_voice(self.mic, self.room,
+                                               stop=self._stopping))
+        if self._stopping.is_set():
+            return
 
         await self.bus.publish(Event.USER_SPEECH_STARTED)
-        await self._face("listening")
+        # Not awaited before recording: a face change is a WiFi round trip,
+        # and the person is already talking.
+        listening = asyncio.create_task(self._face("listening"))
         wav = await self._run(capture_turn, self.mic, self.room, self.vad,
                               self.settings.max_turn_ms, self.settings.silence_ms,
                               self.settings.lead_ms)
+        await listening
         await self.bus.publish(Event.USER_SPEECH_ENDED)
 
         # The gate belongs to the microphone, not to audio in general: the
@@ -690,8 +789,13 @@ class RobotAgent:
                        f"(nothing sent)")
             return
 
-        await self._face("thinking")
-        await self.respond_to_audio(clip)
+        # Same here: the face changes while Whisper transcribes, rather than
+        # the transcription waiting for the face.
+        thinking = asyncio.create_task(self._face("thinking"))
+        try:
+            await self.respond_to_audio(clip)
+        finally:
+            await thinking
         await self._face("neutral")
 
     async def respond_to_audio(self, wav: bytes) -> None:
@@ -699,6 +803,15 @@ class RobotAgent:
         if self.muted:
             await self.ai.send_text(MUTED_WAKE_PROMPT, turn_complete=False)
         await self.ai.send_audio(pcm, rate)
+        # With local speech recognition the words are known before the model
+        # answers, so the mute phrase is acted on here, deterministically. The
+        # model's turn still runs, and its reply follows the new state like
+        # any other (swallowed when muting, spoken when coming back).
+        command = spoken_mute_command(getattr(self.ai, "last_transcript", "") or "")
+        if command == "mute" and not self.muted:
+            await self._dispatch("mute", {})
+        elif command == "unmute" and self.muted:
+            await self._dispatch("unmute", {})
         await self._turn()
 
     async def respond_to_text(self, text: str) -> None:
@@ -754,4 +867,10 @@ class RobotAgent:
 
         if resp.text:
             AI.info(f"bot: {resp.text}")
+        if getattr(resp, "streamed", False):
+            # Already on its way out sentence by sentence; wait for the last
+            # of it so the next turn does not start listening mid-reply.
+            if self._speech_q is not None:
+                await self._speech_q.join()
+        elif resp.text:
             await self._run(self.speech.synthesize, resp.text)

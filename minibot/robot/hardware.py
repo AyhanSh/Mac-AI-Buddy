@@ -152,3 +152,36 @@ class Esp32RobotHardware(RobotHardware):
 
     def is_servo_busy(self) -> bool:
         return self._servo_busy
+
+
+class DetachedHardware(RobotHardware):
+    """Stands in for a robot that is not there.
+
+    Used when the body is unreachable but the voice and the microphone are both
+    on the computer, so a conversation is still possible. Every physical action
+    fails with a plain reason, which the tool layer hands to the model — it
+    must say it cannot move, not describe a movement that never happened.
+    """
+
+    REASON = "the robot body is not connected right now"
+
+    def _absent(self, *_a) -> None:
+        raise Esp32Unavailable(self.REASON)
+
+    set_expression = set_head_position = center_head = _absent
+    play_audio = stop_audio = _absent
+
+    def capture_image(self) -> bytes:
+        raise Esp32Unavailable(self.REASON)
+
+    def get_status(self) -> RobotStatus:
+        return RobotStatus(online=False)
+
+    def is_camera_busy(self) -> bool:
+        return False
+
+    def is_servo_busy(self) -> bool:
+        return False
+
+    def head_position(self) -> tuple[int, int]:
+        return 90, 90

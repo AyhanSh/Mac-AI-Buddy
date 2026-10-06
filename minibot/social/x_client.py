@@ -233,19 +233,28 @@ class XClient:
         data = self._request("POST", f"{API}/2/tweets", json=body).get("data", {})
         return {"id": data.get("id", ""), "text": data.get("text", text)}
 
-    def mentions(self, user_id: str, limit: int = 5) -> list[dict]:
+    def mentions(self, user_id: str, limit: int = 5,
+                 since_id: str = "") -> list[dict]:
         """GET /2/users/:id/mentions — replies and @-mentions, newest first.
 
         Reads are metered far more tightly than writes; on the free tier this
         endpoint answers 429 outright. The caller is expected to let that
         surface as a plain "I can't check right now" rather than treat it as
         broken.
+
+        `since_id` asks the server for mentions newer than one already handled.
+        It keeps the response small and the quota intact, but it is a courtesy
+        rather than a guarantee — the caller still filters locally, because a
+        window that quietly shifts is exactly what put an old mention back in
+        front of autopilot once already.
         """
+        query = {"max_results": max(5, min(100, int(limit))),
+                 "tweet.fields": "created_at,author_id",
+                 "expansions": "author_id", "user.fields": "username"}
+        if since_id:
+            query["since_id"] = str(since_id)
         js = self._request(
-            "GET", f"{API}/2/users/{user_id}/mentions",
-            query={"max_results": max(5, min(100, int(limit))),
-                   "tweet.fields": "created_at,author_id",
-                   "expansions": "author_id", "user.fields": "username"})
+            "GET", f"{API}/2/users/{user_id}/mentions", query=query)
         users = {u["id"]: u.get("username", "")
                  for u in (js.get("includes", {}).get("users") or [])}
         out = []

@@ -26,6 +26,12 @@ from .provider import SpeechProvider
 # began reading a JSON fragment and the text of a safety policy out loud.
 SPEAKABLE_WARN_CHARS = 600
 _CODE_FENCE = re.compile(r"```.*?```", re.S)
+# Emoji, pictographs, and the joiners/variation selectors that glue them
+# together. Told not to, the local model still ends a line with "🤖" now and
+# then, and a voice reading "robot face" out loud is worse than silence.
+_EMOJI = re.compile(
+    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U0001F900-\U0001F9FF"
+    "\uFE0F\u200D\u20E3]+")
 
 
 def speakable(text: str) -> str:
@@ -39,6 +45,7 @@ def speakable(text: str) -> str:
     cleaned = _CODE_FENCE.sub(" ", text).strip()
     if cleaned != text.strip():
         SPEECH.warn("stripped a code block from the reply before speaking")
+    cleaned = " ".join(_EMOJI.sub(" ", cleaned).split())
     if len(cleaned) > SPEAKABLE_WARN_CHARS:
         SPEECH.warn(f"reply is {len(cleaned)} chars — unusually long for a "
                     f"spoken answer; check for leaked model reasoning")
@@ -71,6 +78,13 @@ class ElevenLabsProvider(SpeechProvider):
         self.voice_id = voice_id
         self.model = model
         self.chunk_bytes = chunk_bytes      # ~500 ms at 16 kHz mono
+        # The first piece goes to the robot at half size so it starts talking
+        # sooner. ElevenLabs streams far faster than real time, so the next
+        # full chunk lands well before this one finishes playing.
+        self.first_chunk_bytes = chunk_bytes // 2
+        # One kept-alive connection: a fresh one costs a TLS handshake per
+        # reply, and with sentence streaming there are several per reply.
+        self._http = requests.Session()
         self._cancel = threading.Event()
         self._speaking = threading.Event()
 
@@ -121,7 +135,7 @@ class ElevenLabsProvider(SpeechProvider):
         body = {"text": text, "model_id": self.model,
                 "voice_settings": ELEVEN_SETTINGS}
         sent = 0
-        with requests.post(url, json=body, stream=True, timeout=60,
+        with self._http.post(url, json=body, stream=True, timeout=60,
                            headers={"xi-api-key": self.api_key,
                                     "Content-Type": "application/json"},
                            params={"output_format": ELEVEN_FORMAT}) as r:
@@ -135,12 +149,13 @@ class ElevenLabsProvider(SpeechProvider):
                 if not part:
                     continue
                 buf += part
-                while len(buf) >= self.chunk_bytes:
+                while len(buf) >= (size := self.chunk_bytes if sent
+                                   else self.first_chunk_bytes):
                     if self._cancel.is_set():
                         break
-                    self.hw.play_audio(bytes(buf[: self.chunk_bytes]))
-                    sent += self.chunk_bytes
-                    del buf[: self.chunk_bytes]
+                    self.hw.play_audio(bytes(buf[:size]))
+                    sent += size
+                    del buf[:size]
             if buf and not self._cancel.is_set():
                 self.hw.play_audio(bytes(buf))
                 sent += len(buf)

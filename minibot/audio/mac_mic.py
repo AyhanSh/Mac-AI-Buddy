@@ -26,6 +26,7 @@ sounddevice is an optional dependency — only required when AUDIO_INPUT=mac.
 from __future__ import annotations
 
 import queue
+import threading
 from collections import deque
 
 import numpy as np
@@ -35,6 +36,12 @@ from .dsp import BOT_RATE, MIC_FRAME_MS, pcm_to_wav
 
 FRAME_SAMPLES = int(BOT_RATE * MIC_FRAME_MS / 1000)   # 256 @ 16kHz
 LEVEL_FRAMES = 4   # frames combined per .level() reading (~64ms), see level()
+# Audio from just before record() was called that is kept as the start of the
+# turn. Voice onset is detected by .level() reads, which consume the frames
+# that crossed the threshold — so without this the first syllable is always
+# gone by the time recording starts, and "what are you doing" arrives as
+# "doing." Two onset hits plus polling is ~150-250 ms; this covers it.
+PREROLL_MS = 400
 
 
 class MacMicUnavailable(RuntimeError):
@@ -49,6 +56,27 @@ def _require_sounddevice():
             "AUDIO_INPUT=mac needs the 'sounddevice' package: "
             "pip install sounddevice") from e
     return sd
+
+
+def resolve_device(sd, want: int | str | None, kind: str) -> int | None:
+    """A Core Audio device by (part of) its name, e.g. "EarPods", since the
+    indices shift whenever something is plugged in. One that is not connected
+    falls back to the system default with a warning: unplugged earphones
+    should leave the robot working, not refuse to start. kind: input|output."""
+    if want is None or isinstance(want, int) or not str(want).strip():
+        return want or None
+    want = str(want).strip()
+    if want.isdigit():
+        return int(want)
+    key = f"max_{kind}_channels"
+    found = [(i, d["name"]) for i, d in enumerate(sd.query_devices())
+             if d[key] > 0]
+    for i, name in found:
+        if want.lower() in name.lower():
+            return i
+    AUDIO.warn(f"no {kind} device matching {want!r} — using the system "
+               f"default. Available: {', '.join(n for _, n in found)}")
+    return None
 
 
 class MacMicSource:
@@ -72,8 +100,15 @@ class MacMicSource:
     def __init__(self, rate: int = BOT_RATE, device: int | str | None = None):
         self.sd = _require_sounddevice()
         self.rate = rate
-        self.device = device
-        self._q: "queue.Queue[np.ndarray]" = queue.Queue()
+        self.device = resolve_device(self.sd, device, "input")
+        device = self.device
+        # Frames carry a sequence number so record() can splice the pre-roll
+        # onto the live queue without dropping or repeating one at the seam.
+        self._q: "queue.Queue[tuple[int, np.ndarray]]" = queue.Queue()
+        self._seq = 0
+        self._recent: deque[tuple[int, np.ndarray]] = deque(
+            maxlen=max(1, PREROLL_MS // MIC_FRAME_MS))
+        self._recent_lock = threading.Lock()   # appended on Core Audio's thread
 
         try:
             info = self.sd.query_devices(device, kind="input")
@@ -98,7 +133,11 @@ class MacMicSource:
     def _on_audio(self, indata, frames, time_info, status) -> None:
         if status:
             AUDIO.debug(f"mac mic status: {status}")
-        self._q.put(indata[:, 0].copy())
+        self._seq += 1
+        item = (self._seq, indata[:, 0].copy())
+        with self._recent_lock:
+            self._recent.append(item)
+        self._q.put(item)
 
     # -- duck-typed to match Esp32Client -----------------------------
     def level(self) -> dict:
@@ -121,7 +160,7 @@ class MacMicSource:
         frames = []
         for _ in range(LEVEL_FRAMES):
             try:
-                frames.append(self._q.get(timeout=1.0))
+                frames.append(self._q.get(timeout=1.0)[1])
             except queue.Empty:
                 break
         if not frames:
@@ -138,9 +177,10 @@ class MacMicSource:
                lead_ms: int = 1500) -> bytes:
         """Endpointed recording, same semantics as Esp32Client.record().
 
-        Drops any frames queued from before this call (idle chatter picked up
-        while nothing was listening) so the recording starts from now, not
-        from whatever the mic happened to be capturing during the wait.
+        Starts PREROLL_MS before the call, not at it: the frames that tripped
+        voice onset were consumed by .level(), and they hold the start of the
+        first word. Anything older than that (idle chatter picked up while
+        nothing was listening) is dropped.
 
         The endpoint decision is taken over the same ~64 ms window .level()
         uses, not over one 16 ms frame. Single-frame RMS on a real acoustic mic
@@ -149,7 +189,9 @@ class MacMicSource:
         counter — the recording then never ends early and every turn runs the
         full max_ms. See the note on level() for the same measurement.
         """
-        self._drain()
+        with self._recent_lock:
+            preroll = list(self._recent)
+        last = preroll[-1][0] if preroll else 0
         max_samples = int(self.rate * max_ms / 1000)
         buf: list[np.ndarray] = []
         recent: deque[np.ndarray] = deque(maxlen=LEVEL_FRAMES)
@@ -158,10 +200,19 @@ class MacMicSource:
         quiet_ms = 0.0
         elapsed_ms = 0.0
 
-        while n < max_samples:
-            try:
-                frame = self._q.get(timeout=1.0)
-            except queue.Empty:
+        def frames():
+            for _, f in preroll:
+                yield f
+            while True:
+                try:
+                    seq, f = self._q.get(timeout=1.0)
+                except queue.Empty:
+                    return
+                if seq > last:      # already delivered as pre-roll otherwise
+                    yield f
+
+        for frame in frames():
+            if n >= max_samples:
                 break
             buf.append(frame)
             n += len(frame)
