@@ -1,14 +1,21 @@
 # secrets — never commit these
 .env
 *.key
+wifi_secrets.h
 
 # python
+.venv/
+.venv*/
 venv/
 __pycache__/
 *.pyc
 .python-version
+.pytest_cache/
 
-# local memory store (personal conversation data)
+# personal data: conversation memory, X state, recordings
+*.db
+minibot_seen.json
+mic.wav
 bot_memory/
 brain/bot_memory/
 RobotNotes/

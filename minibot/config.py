@@ -103,6 +103,13 @@ class MemoryConfig:
     working_ttl_seconds: int = 900
 
 
+def _url(v: str) -> str:
+    """OLLAMA_HOST is shared with Ollama's own server, which accepts a bare
+    "127.0.0.1:11434". requests does not."""
+    v = v.strip().rstrip("/")
+    return v if "://" in v else f"http://{v}"
+
+
 def _bool(*names: str, default: bool) -> bool:
     v = _env(*names, default="").strip().lower()
     if v in ("1", "true", "yes", "on"):
@@ -136,6 +143,15 @@ class XConfig:
     timeout: float = 15.0
     retries: int = 2
 
+    # --- autopilot: answering mentions with nobody in the room ---
+    # Deliberately small. Reads are the metered half of the X API, so polling
+    # harder buys 429s rather than freshness; and a cap of three replies per
+    # pass means a bad day is three awkward replies, not a timeline of them.
+    seen_path: str = "minibot_seen.json"
+    autopilot_poll_seconds: float = 900.0
+    autopilot_max_replies: int = 3
+    autopilot_mention_limit: int = 10
+
     @property
     def configured(self) -> bool:
         return all((self.api_key, self.api_secret,
@@ -145,7 +161,20 @@ class XConfig:
 @dataclass(frozen=True)
 class Settings:
     # --- providers ---
-    ai_provider: str = "openai"
+    ai_provider: str = "ollama"
+    # Local: Ollama serves the LLM, mlx-whisper transcribes (AI_PROVIDER=ollama)
+    ollama_host: str = "http://localhost:11434"
+    ollama_model: str = "qwen3-vl:30b-a3b-instruct"
+    # If another app uses the same model through Ollama, give both the same
+    # num_ctx: Ollama holds one copy of a model, and a different num_ctx makes
+    # it reload all 20 GB every time control passes between them.
+    ollama_num_ctx: int = 8192
+    ollama_keep_alive: str = "24h"
+    stt_model: str = "mlx-community/whisper-large-v3-turbo"
+    stt_language: str = ""
+    # Languages the person speaks; transcripts in any other are dropped as
+    # background sound. Comma-separated Whisper codes, e.g. "en,ru".
+    stt_languages: str = ""
     openai_api_key: str = ""
     openai_model: str = "gpt-realtime-2"
     openai_voice: str = "cedar"
@@ -170,6 +199,14 @@ class Settings:
     # for a WiFi round trip mid-sentence. AUDIO_INPUT=bot still switches to the
     # robot's MAX4466 for anyone who wants the robot to hear the room itself.
     audio_input: str = "mac"
+    # Which of the computer's inputs, by (part of) its name, e.g. "EarPods".
+    # Blank = the system default input.
+    mic_device: str = ""
+    # Where the robot's voice comes out: "bot" = the robot's own speaker,
+    # "mac" = this computer's. SPEAKER_DEVICE picks one by name; blank = the
+    # system default output.
+    audio_output: str = "bot"
+    speaker_device: str = ""
     bot_rate: int = 16000
     silence_ms: int = 1000
     max_turn_ms: int = 12000
@@ -193,7 +230,17 @@ class Settings:
     def load(cls) -> "Settings":
         load_dotenv()
         return cls(
-            ai_provider=_env("AI_PROVIDER", default="openai").lower(),
+            ai_provider=_env("AI_PROVIDER", default="ollama").lower(),
+            ollama_host=_url(_env("OLLAMA_HOST",
+                                  default="http://localhost:11434")),
+            ollama_model=_env("OLLAMA_MODEL",
+                              default="qwen3-vl:30b-a3b-instruct"),
+            ollama_num_ctx=_int("OLLAMA_NUM_CTX", default=8192),
+            ollama_keep_alive=_env("OLLAMA_KEEP_ALIVE", default="24h"),
+            stt_model=_env("STT_MODEL",
+                           default="mlx-community/whisper-large-v3-turbo"),
+            stt_language=_env("STT_LANGUAGE"),
+            stt_languages=_env("STT_LANGUAGES"),
             openai_api_key=_env("OPENAI_API_KEY"),
             openai_model=_env("OPENAI_REALTIME_MODEL", "REALTIME_MODEL",
                               default="gpt-realtime-2"),
@@ -212,6 +259,9 @@ class Settings:
             esp32_retries=_int("ESP32_RETRIES", default=2),
             esp32_min_interval=_float("ESP32_MIN_INTERVAL", default=0.02),
             audio_input=_env("AUDIO_INPUT", default="mac").lower(),
+            mic_device=_env("MIC_DEVICE"),
+            audio_output=_env("AUDIO_OUTPUT", default="bot").lower(),
+            speaker_device=_env("SPEAKER_DEVICE"),
             silence_ms=_int("SILENCE_MS", default=1000),
             max_turn_ms=_int("MAX_TURN_MS", default=12000),
             lead_ms=_int("LEAD_MS", default=1500),
@@ -251,6 +301,12 @@ class Settings:
                 max_per_day=_int("X_MAX_POSTS_PER_DAY", default=20),
                 timeout=_float("X_TIMEOUT", default=15.0),
                 retries=_int("X_RETRIES", default=2),
+                seen_path=_env("X_SEEN_PATH", default="minibot_seen.json"),
+                autopilot_poll_seconds=_float("X_AUTOPILOT_POLL_SECONDS",
+                                              default=900.0),
+                autopilot_max_replies=_int("X_AUTOPILOT_MAX_REPLIES", default=3),
+                autopilot_mention_limit=_int("X_AUTOPILOT_MENTION_LIMIT",
+                                             default=10),
             ),
             log_level=_env("LOG_LEVEL", default="INFO").upper(),
         )

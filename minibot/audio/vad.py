@@ -79,13 +79,16 @@ def calibrate(client, n: int = 10, **room_kw) -> Room:
 
 
 def wait_for_voice(client, room: Room, consecutive: int = 2,
-                   poll: float = 0.02) -> None:
+                   poll: float = 0.02, stop=None) -> None:
     """Block until sustained sound. Each /level call already takes ~20 ms on
     the device plus a round trip, so two hits is roughly 150 ms of evidence —
     enough to ignore a single click, short enough that little is clipped off
     the front of your first word before /mic takes over."""
+    # `stop` (a threading.Event) ends the wait from outside. This runs on a
+    # worker thread, and Python will not exit while one is still looping —
+    # without it, ctrl-c in a silent room hung the process for good.
     hits = 0
-    while True:
+    while not (stop is not None and stop.is_set()):
         try:
             rms = client.level()["rms"]
         except requests.RequestException:

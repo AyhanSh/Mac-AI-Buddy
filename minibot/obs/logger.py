@@ -64,11 +64,16 @@ class Channel:
         holder: dict[str, object] = {}
         try:
             yield holder
-        finally:
+        except Exception as e:
+            # Not the success label: "frame captured (207ms)" printed for a
+            # capture that had just failed is a log that lies.
             ms = (time.perf_counter() - t0) * 1000
-            note = holder.get("note")
-            suffix = f" {note}" if note else ""
-            self._emit(level, f"{label}{suffix} ({ms:.0f}ms)")
+            self._emit(logging.WARNING, f"{label} — FAILED after {ms:.0f}ms: {e!r}")
+            raise
+        ms = (time.perf_counter() - t0) * 1000
+        note = holder.get("note")
+        suffix = f" {note}" if note else ""
+        self._emit(level, f"{label}{suffix} ({ms:.0f}ms)")
 
 
 AI = Channel("AI")

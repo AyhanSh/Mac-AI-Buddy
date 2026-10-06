@@ -284,3 +284,40 @@ def test_the_face_stays_asleep_while_muted():
     run(agent._face("listening"))
     run(agent._face("thinking"))
     assert agent.hw.faces == before
+
+
+# -- the phrase itself, caught locally ------------------------------
+
+class HeardAI(FakeAI):
+    """A provider with local speech recognition: it knows the words."""
+
+    def __init__(self, heard):
+        super().__init__()
+        self.heard = heard
+
+    async def send_audio(self, pcm, rate):
+        await super().send_audio(pcm, rate)
+        self.last_transcript = self.heard
+
+
+def test_saying_mute_mutes_even_if_the_model_forgets_the_tool():
+    """Observed live: "Mute mode." got "I'm muted now" and no mute call."""
+    agent = RobotAgent(Settings(), FakeHardware(), HeardAI("Mute mode."),
+                       FakeSpeech(), EventBus())
+    run(agent.respond_to_audio(silence(500)))
+    assert agent.muted
+
+
+def test_saying_mute_off_unmutes():
+    agent = RobotAgent(Settings(), FakeHardware(), HeardAI("Mute off."),
+                       FakeSpeech(), EventBus())
+    agent.muted = True
+    run(agent.respond_to_audio(silence(500)))
+    assert not agent.muted
+
+
+def test_a_sentence_mentioning_mute_is_just_a_sentence():
+    agent = RobotAgent(Settings(), FakeHardware(),
+                       HeardAI("Don't mute the TV."), FakeSpeech(), EventBus())
+    run(agent.respond_to_audio(silence(500)))
+    assert not agent.muted

@@ -44,6 +44,9 @@ class AIResponse:
     tool_calls: list[ToolCall] = field(default_factory=list)
     interrupted: bool = False
     error: str | None = None
+    # True when the text was already handed to on_text piece by piece as it
+    # was generated, so the caller has spoken it and must not speak it again.
+    streamed: bool = False
 
 
 # handler(name, arguments) -> JSON-serializable result
@@ -58,9 +61,31 @@ ToolHandler = Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]]
 # never contains what it asked for.
 IMAGE_RESULT_KEY = "_image"
 
+# A tool result may carry, under this key, the exact words to say as the
+# answer. A provider with supports_direct_reply speaks them and ends the turn
+# there instead of calling the model again just to phrase the result — one
+# whole model round saved. Only sent to providers that declare support.
+DIRECT_REPLY_KEY = "_reply"
+
+
+class ProviderUnavailable(RuntimeError):
+    """The model cannot be reached or used at all — a startup error with a
+    fix to tell the person about, not a traceback."""
+
+
+# on_text(chunk): a complete sentence or two of the reply, delivered while the
+# rest is still being generated so speech can start early.
+TextHandler = Callable[[str], Awaitable[None]]
+
 
 class AIProvider(ABC):
     name: str = "base"
+    # Set by the caller to receive the reply as it is generated. Providers that
+    # cannot stream ignore it and leave AIResponse.streamed False, and the
+    # caller then speaks the final text as before.
+    on_text: TextHandler | None = None
+    # Whether a tool result's DIRECT_REPLY_KEY is honoured (see above).
+    supports_direct_reply: bool = False
 
     @abstractmethod
     async def connect(self) -> None: ...

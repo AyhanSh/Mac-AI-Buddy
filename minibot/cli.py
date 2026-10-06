@@ -15,9 +15,9 @@ from pathlib import Path
 
 import numpy as np
 
-from .agent.prompts import INSTRUCTIONS
+from .agent.prompts import AUTOPILOT_PERSONA, INSTRUCTIONS
 from .agent.robot_agent import RobotAgent
-from .ai.provider import AIProvider
+from .ai.provider import AIProvider, ProviderUnavailable
 from .audio.dsp import BOT_RATE, wav_to_pcm
 from .audio.mac_mic import MacMicUnavailable
 from .audio.vad import calibrate
@@ -25,35 +25,63 @@ from .config import PROJECT_ROOT, Settings
 from .events.bus import Event, EventBus
 from .memory.manager import MemoryManager
 from .obs import logger
-from .obs.logger import APP, MEMORY, ROBOT, SOCIAL, STATE
+from .obs.logger import AI, APP, MEMORY, ROBOT, SOCIAL, STATE
 from .robot.esp32_client import Esp32Client
 from .robot.hardware import Esp32RobotHardware
 from .social.account import XAccount, describe_failure
+from .social.autopilot import Autopilot
+from .social.seen import SeenStore
 from .social.x_client import XClient, XCredentials
 from .speech.elevenlabs_provider import ElevenLabsProvider, list_voices
 
 
-def build_ai_provider(s: Settings) -> AIProvider:
-    """Provider selection lives here alone (§24). AI_PROVIDER=gemini|openai."""
+def build_ai_provider(s: Settings, persona: str = INSTRUCTIONS,
+                      with_stt: bool = True) -> AIProvider:
+    """Provider selection lives here alone (§24).
+    AI_PROVIDER=ollama|gemini|openai — ollama is fully local.
+
+    `persona` is a parameter because autopilot is a different job from being a
+    robot on a desk — it has no body, no room, and nobody to answer to — and
+    handing it the desk-robot instructions would have it describing movements
+    it cannot make to people who cannot see it.
+    """
+    if s.ai_provider == "ollama":
+        from .ai.ollama_provider import OllamaProvider
+        from .speech.stt import MlxWhisperSTT
+        # Autopilot only ever sends text; loading Whisper there would cost a
+        # gigabyte of memory for ears it never uses.
+        stt = (MlxWhisperSTT(s.stt_model, s.stt_language,
+                             languages=set(s.stt_languages.split(",")))
+               if with_stt else None)
+        return OllamaProvider(s.ollama_host, s.ollama_model, persona, stt,
+                              num_ctx=s.ollama_num_ctx,
+                              keep_alive=s.ollama_keep_alive)
     if s.ai_provider == "gemini":
         from .ai.gemini_provider import GeminiRoboticsProvider
         if not s.gemini_api_key:
             sys.exit("AI_PROVIDER=gemini but GEMINI_API_KEY is not set")
-        return GeminiRoboticsProvider(s.gemini_api_key, s.gemini_model, INSTRUCTIONS)
+        return GeminiRoboticsProvider(s.gemini_api_key, s.gemini_model, persona)
     if s.ai_provider == "openai":
         from .ai.openai_provider import OpenAIRealtimeProvider
         if not s.openai_api_key:
             sys.exit("AI_PROVIDER=openai but OPENAI_API_KEY is not set")
-        return OpenAIRealtimeProvider(s.openai_api_key, s.openai_model, INSTRUCTIONS)
-    sys.exit(f"unknown AI_PROVIDER={s.ai_provider!r} (expected gemini or openai)")
+        return OpenAIRealtimeProvider(s.openai_api_key, s.openai_model, persona)
+    sys.exit(f"unknown AI_PROVIDER={s.ai_provider!r} "
+             "(expected ollama, gemini or openai)")
 
 
-def build_stack(s: Settings):
+# How long startup waits for a robot that is required but not answering.
+ROBOT_WAIT_S = 30.0
+
+
+def build_stack(s: Settings, speaker=None):
+    """`speaker` is where the voice plays: the robot when None, otherwise
+    anything with play_audio()/stop_audio() — the Mac's own speakers."""
     bus = EventBus()
     client = Esp32Client(s.esp32_base_url, s.esp32_timeout, s.esp32_retries,
                          s.esp32_min_interval)
     hardware = Esp32RobotHardware(client)
-    speech = ElevenLabsProvider(hardware, s.elevenlabs_api_key,
+    speech = ElevenLabsProvider(speaker or hardware, s.elevenlabs_api_key,
                                 s.elevenlabs_voice_id, s.elevenlabs_model)
     return bus, client, hardware, speech
 
@@ -82,7 +110,7 @@ def build_memory(s: Settings) -> MemoryManager | None:
         return None
 
 
-def build_x(s: Settings) -> XAccount | None:
+def build_x(s: Settings, announce: bool = True) -> XAccount | None:
     """The robot's X account, or None if it doesn't have one.
 
     Same posture as memory (§21): a social account is a nice-to-have, and no
@@ -104,12 +132,104 @@ def build_x(s: Settings) -> XAccount | None:
         SOCIAL.warn(f"X credentials rejected, posting disabled: "
                     f"{describe_failure(e)}")
         return None
-    mode = ("dry run" if s.x.dry_run else
-            "confirmation required" if s.x.require_confirm else
-            "POSTS WITHOUT CONFIRMATION")
-    SOCIAL.info(f"x: @{who['username']} ({mode}, "
-                f"{s.x.max_per_hour}/hour, {s.x.max_per_day}/day)")
+    # Skipped when the caller is about to change the posture: announcing
+    # "confirmation required" and then turning confirmation off one line later
+    # is the log telling you a guard is in place that is not.
+    if announce:
+        mode = ("dry run" if s.x.dry_run else
+                "confirmation required" if s.x.require_confirm else
+                "POSTS WITHOUT CONFIRMATION")
+        SOCIAL.info(f"x: @{who['username']} ({mode}, "
+                    f"{s.x.max_per_hour}/hour, {s.x.max_per_day}/day)")
     return account
+
+
+async def autopilot(s: Settings, once: bool = False,
+                    dry_run: bool = False) -> None:
+    """Answer mentions with nobody in the room.
+
+    Runs headless on purpose. There is no microphone, no speaker and no robot
+    in this path — it is a laptop, an API key and an X account, so it keeps
+    working when the ESP32 is unplugged, asleep, or on a different network.
+    A reachable robot is used for nothing here and is never waited on.
+    """
+    x = build_x(s, announce=False)
+    if x is None:
+        sys.exit("autopilot needs a working X account — run --x-check to see "
+                 "why the credentials were refused.")
+    if dry_run:
+        x.dry_run = True
+    # Confirmation is meaningless here: there is nobody to confirm to. The
+    # flag on the command line IS the consent, and it is per-run. X_REQUIRE_
+    # CONFIRM in .env is deliberately overridden rather than honoured, so the
+    # log has to say that plainly instead of repeating what the file said.
+    x.require_confirm = False
+    posture = ("dry run — nothing is published" if x.dry_run else
+               "REPLIES GO OUT UNCONFIRMED")
+    SOCIAL.info(f"x: @{x.username} (autopilot: {posture}, "
+                f"{s.x.max_per_hour}/hour, {s.x.max_per_day}/day)")
+
+    seen_path = Path(s.x.seen_path)
+    if not seen_path.is_absolute():
+        seen_path = PROJECT_ROOT / seen_path
+    seen = SeenStore(seen_path)
+
+    provider = build_ai_provider(s, AUTOPILOT_PERSONA, with_stt=False)
+    provider.register_tools([], _no_tools)   # no tools at all: see autopilot.py
+    # Connect once to prove the key works — a bad key should fail now, not in
+    # four hours when the first mention arrives — then let the socket go.
+    # Autopilot opens a fresh session per mention; an idle Live connection is
+    # closed from the far end within minutes anyway.
+    try:
+        await provider.connect()
+    except ProviderUnavailable as e:
+        sys.exit(str(e))
+    await provider.disconnect()
+
+    pilot = Autopilot(provider, x, seen,
+                      max_replies_per_pass=s.x.autopilot_max_replies,
+                      mention_limit=s.x.autopilot_mention_limit,
+                      poll_seconds=s.x.autopilot_poll_seconds)
+
+    live = "DRY RUN" if x.dry_run else "LIVE — replies are public"
+    APP.info(f"autopilot: {live}. up to {s.x.autopilot_max_replies} replies per "
+             f"pass, every {_every(s.x.autopilot_poll_seconds)}. ctrl-c to stop.")
+    if not x.dry_run:
+        APP.warn("nobody is checking these replies before they go out")
+    # Reads are the metered half of the X API and this loop does nothing else.
+    # Said once at startup rather than as a warning per poll, which would bury
+    # the replies you actually want to see in the log.
+    per_day = 86400 / max(1.0, s.x.autopilot_poll_seconds)
+    if per_day > 500:
+        APP.warn(f"polling this often is about {per_day:,.0f} reads a day — "
+                 "well past what X's cheaper tiers allow, so expect 429s and "
+                 "long stretches where nothing is checked at all")
+    try:
+        if once:
+            await pilot.poll_once()
+        else:
+            await pilot.run_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        await provider.disconnect()
+        APP.info("autopilot stopped")
+
+
+def _every(seconds: float) -> str:
+    """"every 0 min" is what `seconds / 60` prints for a 30 second interval."""
+    if seconds < 90:
+        return f"{seconds:.0f}s"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds / 3600:.1f} h"
+
+
+async def _no_tools(name: str, args: dict) -> dict:
+    """Autopilot registers no tools; this exists so a model that invents one
+    gets a refusal instead of reaching a dispatcher that does something."""
+    AI.warn(f"autopilot has no tools; refused {name!r}")
+    return {"ok": False, "error": "you have no tools here. Reply with text."}
 
 
 def x_check(s: Settings) -> None:
@@ -143,20 +263,62 @@ async def run(args, s: Settings) -> None:
     # fail instantly, not hide behind a network timeout to the robot.
     provider = build_ai_provider(s)
 
-    bus, client, hardware, speech = build_stack(s)
+    speaker = None
+    if s.audio_output == "mac":
+        from .audio.mac_speaker import MacSpeaker
+        try:
+            speaker = MacSpeaker(BOT_RATE, s.speaker_device or None)
+        except MacMicUnavailable as e:
+            sys.exit(str(e))
+    elif s.audio_output != "bot":
+        APP.warn(f"unknown AUDIO_OUTPUT={s.audio_output!r}, using the robot's "
+                 "speaker")
 
-    st = hardware.get_status()
+    bus, client, hardware, speech = build_stack(s, speaker)
+
+    # Probe with short timeouts: the full request policy (8 s x 3 tries) made
+    # an unanswering robot cost ~24 s of silence before anything was logged.
+    saved = client.timeout, client.retries
+    client.timeout, client.retries = 3.0, 0
+    try:
+        st = hardware.get_status()
+        if not (speaker and s.audio_input != "bot"):
+            # The robot is required here, but a failed first check is often the
+            # robot rejoining WiFi, not a robot that is gone: observed
+            # 2026-10-06, "Host is down" at startup and answering again ~20 s
+            # later. Give it that long before giving up.
+            deadline = time.monotonic() + ROBOT_WAIT_S
+            if not st.online:
+                APP.warn(f"robot not answering at {s.esp32_base_url} — waiting "
+                         f"up to {ROBOT_WAIT_S:.0f} s in case it is rejoining WiFi")
+            while not st.online and time.monotonic() < deadline:
+                time.sleep(2)
+                st = hardware.get_status()
+    finally:
+        client.timeout, client.retries = saved
     if not st.online:
-        sys.exit(f"robot unreachable at {s.esp32_base_url}")
-    APP.info(f"robot: camera={st.camera} oled={st.oled} servos={st.servos} "
-             f"audio={st.audio} mic={st.mic} rssi={st.rssi}dBm")
-    if not st.audio:
-        APP.warn("audio not ready on the robot — you will hear nothing")
-    if not st.mic:
-        APP.warn("mic not ready — use --text")
-    if not st.camera:
-        APP.warn("camera not ready — /capture will 503 and take_photo will "
-                 "fail. Check the serial log for 'Camera init failed'.")
+        # With the voice and the ears both on this computer, a conversation
+        # does not need the body. Anything else does: without the robot there
+        # would be nothing to hear you or nothing to speak.
+        if not (speaker and s.audio_input != "bot"):
+            sys.exit(f"robot unreachable at {s.esp32_base_url} — power-cycle "
+                     "it, or set AUDIO_OUTPUT=mac to run without it")
+        APP.warn(f"robot unreachable at {s.esp32_base_url} — carrying on "
+                 "without it: talking through this Mac, but no face, head or "
+                 "camera this run")
+        from .robot.hardware import DetachedHardware
+        hardware = DetachedHardware()
+    else:
+        APP.info(f"robot: camera={st.camera} oled={st.oled} servos={st.servos} "
+                 f"audio={st.audio} mic={st.mic} rssi={st.rssi}dBm")
+        if not st.audio and not speaker:
+            APP.warn("audio not ready on the robot — you will hear nothing")
+        if not st.mic and s.audio_input == "bot":
+            APP.warn("mic not ready — use --text")
+        if not st.camera:
+            APP.warn("camera not ready — /capture will 503 and take_photo "
+                     "will fail. Check the serial log for 'Camera init "
+                     "failed'.")
     if not speech.configured:
         APP.warn("ElevenLabs not configured — the robot will be silent")
 
@@ -173,11 +335,14 @@ async def run(args, s: Settings) -> None:
     bus.subscribe(Event.STATE_CHANGED,
                   lambda m: STATE.info(str(m.payload.get("state"))))
 
-    agent = RobotAgent(s, hardware, provider, speech, bus, memory, x)
+    agent = RobotAgent(s, hardware, provider, speech, bus, memory, x,
+                       speaker=speaker)
 
     try:
         try:
             await agent.start()
+        except ProviderUnavailable as e:
+            sys.exit(str(e))
         except MacMicUnavailable as e:
             # This is the default input now, so its failure is a first-class
             # startup error rather than a traceback out of an opt-in path.
@@ -227,7 +392,7 @@ def open_mic(s: Settings):
         _, client, _, _ = build_stack(s)
         return client
     from .audio.mac_mic import MacMicSource
-    return MacMicSource()
+    return MacMicSource(BOT_RATE, s.mic_device or None)
 
 
 def levels(s: Settings, seconds: float = 15.0) -> None:
@@ -285,7 +450,17 @@ def main() -> None:
                     help="print your ElevenLabs voices and exit")
     ap.add_argument("--x-check", action="store_true",
                     help="verify the X credentials and exit (posts nothing)")
-    ap.add_argument("--provider", choices=["gemini", "openai"],
+    ap.add_argument("--autopilot", action="store_true",
+                    help="answer X mentions unattended. No robot, no "
+                         "microphone, and no confirmation before replies go "
+                         "out — rehearse it with --dry-run first")
+    ap.add_argument("--once", action="store_true",
+                    help="with --autopilot: check mentions a single time and "
+                         "exit, instead of polling forever")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="with --autopilot: compose and log replies without "
+                         "publishing any of them")
+    ap.add_argument("--provider", choices=["ollama", "gemini", "openai"],
                     help="override AI_PROVIDER for this run")
     ap.add_argument("--log-level", default=None)
     args = ap.parse_args()
@@ -313,7 +488,13 @@ def main() -> None:
     if args.levels:
         levels(s)
         return
-    asyncio.run(run(args, s))
+    if args.autopilot:
+        asyncio.run(autopilot(s, once=args.once, dry_run=args.dry_run))
+        return
+    try:
+        asyncio.run(run(args, s))
+    except KeyboardInterrupt:
+        pass    # ctrl-c is how you stop it; "bye" is already logged
 
 
 if __name__ == "__main__":
